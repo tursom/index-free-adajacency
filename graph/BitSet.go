@@ -2,12 +2,22 @@ package graph
 
 import (
 	"encoding/hex"
+
+	"index-free-adjacency/wal"
 )
 
+// BitSet 位图，用于在遍历时表示某一个节点在使用中
 type BitSet []uint8
 
 func (b BitSet) BitLength() int {
 	return len(b) * 8
+}
+
+func (b BitSet) SetBitWAL(log *wal.WAL, bit int, up bool) (old bool) {
+	arrIndex := bit / 8
+	wal.AddValueRec(log, &b[arrIndex])
+
+	return b.SetBit(bit, up)
 }
 
 func (b BitSet) SetBit(bit int, up bool) (old bool) {

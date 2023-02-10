@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"unsafe"
+
+	"index-free-adjacency/wal"
 )
 
 const (
@@ -63,6 +65,9 @@ type (
 		relation *Relation
 	}
 
+	// slice 切片的另类实现，主要为了方便扩展数组的大小
+	// 每个 slice[T] 都是一片连续内存，在复制或者移动 slice[T] 本身时能保证指向的内存地址不变
+	// 指向的地址不变，使得在扩展时所有对本切片元素的引用都不需要变动。
 	slice[T any] struct {
 		arr *[pageSize]T
 		len uint32
@@ -101,6 +106,7 @@ func (g *Graph) RelationCount() int {
 	return g.relationCount
 }
 
+// getNodeUnsafe 通过索引获取节点的引用
 func (g *Graph) getNodeUnsafe(index Index) *Node {
 	return &g.nodes[index/pageSize].arr[index%pageSize]
 }
@@ -113,42 +119,53 @@ func (g *Graph) GetRelation(index Index) *Relation {
 	return g.getRelationUnsafe(index)
 }
 
+// getNodeUnsafe 通过索引获取关系的引用
 func (g *Graph) getRelationUnsafe(index Index) *Relation {
 	return &g.relations[index/pageSize].arr[index%pageSize]
 }
 
 func (g *Graph) AddNode(label string) (index Index) {
+	var log wal.WAL
+	defer func() {
+		log.RollBackWhenPanic(recover())
+	}()
+
 	if g.freeNode != 0 {
 		freeNodeIndex := g.freeNode - 1
 		n := g.getNodeUnsafe(freeNodeIndex)
-		g.freeNode = n.index
-		n.index = freeNodeIndex
+		wal.SetValue(&log, &g.freeNode, n.index)
+		wal.SetValue(&log, &n.index, freeNodeIndex)
 		index = freeNodeIndex
 	} else {
 		lastNodes := lastPage(&g.nodes)
 
 		index = (len(g.nodes)-1)*pageSize + int(lastNodes.len)
-		lastNodes.arr[lastNodes.len] = Node{
+		wal.SetValue(&log, &lastNodes.arr[lastNodes.len], Node{
 			index: index,
 			g:     g,
-		}
-		lastNodes.len++
+		})
+		wal.IncUInt32(&log, &lastNodes.len)
 	}
 
 	n := g.getNodeUnsafe(index)
-	n.label = label
+	wal.SetValue(&log, &n.label, label)
 
 	if g.usedNodes.BitLength() < len(g.nodes)*pageSize {
 		g.usedNodes = append(g.usedNodes, 0)
 	}
-	g.usedNodes.SetBit(index, true)
+	g.usedNodes.SetBitWAL(&log, index, true)
 
-	g.nodeCount++
+	wal.IncInt(&log, &g.nodeCount)
 
 	return index
 }
 
 func (g *Graph) AddRelation(from, to Index) Index {
+	var log wal.WAL
+	defer func() {
+		log.RollBackWhenPanic(recover())
+	}()
+
 	f := g.GetNode(from)
 	if f == nil {
 		return -1
@@ -162,44 +179,44 @@ func (g *Graph) AddRelation(from, to Index) Index {
 	if g.freeRelation != nil {
 		// reuse free Relation slot
 		rla = g.freeRelation
-		g.freeRelation = rla.sn
+		wal.SetValue(&log, &g.freeRelation, rla.sn)
 
-		rla.from = f
-		rla.to = t
-		rla.sp = nil
-		rla.ep = nil
+		wal.SetValue(&log, &rla.from, f)
+		wal.SetValue(&log, &rla.to, t)
+		wal.SetValue(&log, &rla.sp, nil)
+		wal.SetValue(&log, &rla.ep, nil)
 	} else {
 		lastRelations := lastPage(&g.relations)
-		lastRelations.arr[lastRelations.len] = Relation{
+		wal.SetValue(&log, &lastRelations.arr[lastRelations.len], Relation{
 			index: (len(g.relations)-1)*pageSize + int(lastRelations.len),
 			from:  f,
 			to:    t,
-		}
+		})
 
 		rla = &lastRelations.arr[lastRelations.len]
-		rla.g = g
+		wal.SetValue(&log, &rla.g, g)
 
-		lastRelations.len++
+		wal.IncUInt32(&log, &lastRelations.len)
 	}
 
-	rla.sn = f.firstRelation
+	wal.SetValue(&log, &rla.sn, f.firstRelation)
 	if f.firstRelation != nil {
-		f.firstRelation.sp = rla
+		wal.SetValue(&log, &f.firstRelation.sp, rla)
 	}
-	f.firstRelation = rla
+	wal.SetValue(&log, &f.firstRelation, rla)
 
-	rla.en = t.firstRelation
+	wal.SetValue(&log, &rla.en, t.firstRelation)
 	if t.firstRelation != nil {
-		t.firstRelation.ep = rla
+		wal.SetValue(&log, &t.firstRelation.ep, rla)
 	}
-	t.firstRelation = rla
+	wal.SetValue(&log, &t.firstRelation, rla)
 
 	if g.usedRelations.BitLength() < len(g.relations)*pageSize {
 		g.usedRelations = append(g.usedRelations, 0)
 	}
-	g.usedRelations.SetBit(rla.index, true)
+	g.usedRelations.SetBitWAL(&log, rla.index, true)
 
-	g.relationCount++
+	wal.IncInt(&log, &g.relationCount)
 
 	return rla.index
 }
@@ -214,21 +231,30 @@ func (g *Graph) DeleteNode(node Index) error {
 		return ErrRelation
 	}
 
-	g.usedNodes.SetBit(node, false)
+	var log wal.WAL
+	defer func() {
+		log.RollBackWhenPanic(recover())
+	}()
 
+	log.AddRollBack(func() {
+		g.usedNodes.SetBitWAL(&log, node, true)
+	})
+	g.usedNodes.SetBitWAL(&log, node, false)
+
+	// 节点有属性，一次性回收所有属性
 	if n.firstProperty != nil {
 		lastPpt := n.firstProperty
 		for lastPpt.next != nil {
 			lastPpt = lastPpt.next
 		}
 
-		lastPpt.next = g.freeProperty
-		g.freeProperty = n.firstProperty
+		wal.SetValue(&log, &lastPpt.next, g.freeProperty)
+		wal.SetValue(&log, &g.freeProperty, n.firstProperty)
 	}
 
 	index := n.index
-	n.index = g.freeNode
-	g.freeNode = index + 1
+	wal.SetValue(&log, &n.index, g.freeNode)
+	wal.SetValue(&log, &g.freeNode, index+1)
 
 	g.nodeCount--
 
@@ -240,44 +266,52 @@ func (g *Graph) DeleteRelation(relation Index) error {
 		return ErrDeletedRelation
 	}
 
-	g.usedRelations.SetBit(relation, false)
+	var log wal.WAL
+	defer func() {
+		log.RollBackWhenPanic(recover())
+	}()
+
+	log.AddRollBack(func() {
+		g.usedRelations.SetBitWAL(&log, relation, true)
+	})
+	g.usedRelations.SetBitWAL(&log, relation, false)
 
 	r := g.getRelationUnsafe(relation)
 
 	if r.sp == nil {
-		r.from.firstRelation = r.sn
+		wal.SetValue(&log, &r.from.firstRelation, r.sn)
 	} else if r.sp.from == r.from {
-		r.sp.sn = r.sn
+		wal.SetValue(&log, &r.sp.sn, r.sn)
 	} else {
-		r.sp.en = r.sn
+		wal.SetValue(&log, &r.sp.en, r.sn)
 	}
 
 	if r.ep == nil {
-		r.to.firstRelation = r.en
+		wal.SetValue(&log, &r.to.firstRelation, r.en)
 	} else if r.ep.to == r.to {
-		r.ep.en = r.en
+		wal.SetValue(&log, &r.ep.en, r.en)
 	} else {
-		r.ep.sn = r.en
+		wal.SetValue(&log, &r.ep.sn, r.en)
 	}
 
 	if r.sn == nil { // safe check, do nothing
 	} else if r.sn.from == r.from {
-		r.sn.sp = r.sp
+		wal.SetValue(&log, &r.sn.sp, r.sp)
 	} else {
-		r.sn.ep = r.sp
+		wal.SetValue(&log, &r.sn.ep, r.sp)
 	}
 
 	if r.en == nil { // safe check, do nothing
 	} else if r.en.to == r.to {
-		r.en.ep = r.ep
+		wal.SetValue(&log, &r.en.ep, r.ep)
 	} else {
-		r.en.sp = r.ep
+		wal.SetValue(&log, &r.en.sp, r.ep)
 	}
 
-	r.sn = g.freeRelation
-	g.freeRelation = r
+	wal.SetValue(&log, &r.sn, g.freeRelation)
+	wal.SetValue(&log, &g.freeRelation, r)
 
-	g.relationCount--
+	wal.DecInt(&log, &g.relationCount)
 
 	return nil
 }
@@ -414,10 +448,15 @@ func (p *property) toMap() map[string]any {
 }
 
 func setProperty(g *Graph, p **property, key string, value any) {
+	var log wal.WAL
+	defer func() {
+		log.RollBackWhenPanic(recover())
+	}()
+
 	ppt := *p
 	for ppt != nil {
 		if ppt.key == key {
-			ppt.value = value
+			wal.SetValue(&log, &ppt.value, value)
 			return
 		}
 		ppt = ppt.next
@@ -425,29 +464,34 @@ func setProperty(g *Graph, p **property, key string, value any) {
 
 	if g.freeProperty != nil {
 		ppt = g.freeProperty
-		g.freeProperty = ppt.next
+		wal.SetValue(&log, &g.freeProperty, ppt.next)
 	} else {
 		propertiesPage := lastPage(&g.properties)
 		ppt = &propertiesPage.arr[propertiesPage.len]
-		propertiesPage.len++
+		wal.IncUInt32(&log, &propertiesPage.len)
 	}
 
-	ppt.next = *p
-	*p = ppt
+	wal.SetValue(&log, &ppt.next, *p)
+	wal.SetValue(&log, p, ppt)
 
-	ppt.key = key
-	ppt.value = value
+	wal.SetValue(&log, &ppt.key, key)
+	wal.SetValue(&log, &ppt.value, value)
 }
 
 func delProperty(g *Graph, p **property, key string) bool {
+	var log wal.WAL
+	defer func() {
+		log.RollBackWhenPanic(recover())
+	}()
+
 	prev := p
 	ppt := *prev
 	for ppt != nil {
 		if ppt.key == key {
-			*prev = ppt.next
+			wal.SetValue(&log, prev, ppt.next)
 
-			ppt.next = g.freeProperty
-			g.freeProperty = ppt
+			wal.SetValue(&log, &ppt.next, g.freeProperty)
+			wal.SetValue(&log, &g.freeProperty, ppt)
 
 			return true
 		}
