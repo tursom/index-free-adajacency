@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unsafe"
 
-	"index-free-adjacency/wal"
+	"github.com/tursom/index-free-adjacency/wal"
 )
 
 const (
